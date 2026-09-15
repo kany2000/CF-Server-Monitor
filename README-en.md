@@ -69,7 +69,7 @@ Compared with traditional controller-style monitoring tools, CF-Server-Monitor i
 | Admin panel | Server CRUD, drag sorting, hidden servers, import/export, batch delete, database maintenance |
 | Cross-platform Agent | Mainstream Linux, Alpine Linux, OpenWrt, Synology DSM, Feiniu fnOS, FreeBSD, macOS, Windows; Go Agent by default, Shell/PowerShell still available |
 | Realtime push | Durable Objects + WebSocket refresh the UI immediately after Agent reports |
-| Alerts | Offline alerts, recovery notices, expiration reminders, resource load rules |
+| Alerts | Offline alerts, recovery notices, expiration reminders, resource load rules, daily/weekly/monthly traffic reports |
 | Multi-language | Built-in Chinese and English frontend switch; Chinese and English documentation |
 | Multi-site | GitHub Pages static frontend and aggregation of multiple Worker APIs |
 | Widget | iOS Scriptable widget script for quick mobile status checks |
@@ -348,6 +348,7 @@ Supported alert types:
 - Offline alert: notify after a node stays offline for the configured delay; send recovery notice when it returns.
 - Expiration reminder: notify daily 1 to 7 days before expiration at the configured notification timezone and expiration notification time, or disable it.
 - Resource alert: define rules for CPU, memory, disk, inbound/outbound network speed, and similar metrics.
+- Traffic reports: when enabled, three lightweight JSON network-counter baselines are maintained in the notification timezone. Daily reports are sent every day, weekly reports on Monday, and monthly reports on the first day. A missing previous baseline is reported as unavailable. Server or Agent restarts may reset interface counters and affect the current period.
 
 Send a test notification before saving.
 
@@ -463,7 +464,7 @@ After upgrading from older versions to versions with GPU, disk IO, packet loss, 
 | Cron | Description |
 | --- | --- |
 | `*/1 * * * *` | Detect offline nodes/resource alerts every minute |
-| `0 * * * *` | Run hourly combined tasks, including monthly table rotation, old table cleanup, and expiration checks at the configured notification timezone/hour |
+| `0 * * * *` | Run hourly combined tasks, including monthly table rotation, old table cleanup, expiration checks, and traffic reports in the configured notification timezone |
 
 ## Local Development
 

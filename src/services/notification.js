@@ -79,6 +79,12 @@ function isExpireNotificationTimeDue(settings = {}, timestamp = Date.now()) {
   return Number(parts.hour) === Number(normalizeExpireNotificationTime(settings.expire_notification_time));
 }
 
+function isTrafficReportTimeDue(settings = {}, timestamp = Date.now()) {
+  const parts = getZonedDateParts(timestamp, settings.notification_timezone);
+  if (!parts) return false;
+  return Number(parts.hour) === Number(normalizeExpireNotificationTime(settings.traffic_report_time));
+}
+
 function getZonedDateSerial(timestamp, timezone) {
   const parts = getZonedDateParts(timestamp, timezone);
   if (!parts) return NaN;
@@ -100,6 +106,27 @@ function parseDateSerial(dateString) {
     return NaN;
   }
   return Math.floor(date.getTime() / DAY_MS);
+}
+
+function formatDateSerial(serial) {
+  const date = new Date(serial * DAY_MS);
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
+}
+
+function formatTrafficBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let size = bytes;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size.toFixed(unit === 0 || size >= 100 ? 0 : size >= 10 ? 1 : 2)} ${units[unit]}`;
+}
+
+function isTrafficReportEnabled(settings, field) {
+  return normalizeBooleanSetting(settings?.[field]) === 'true';
 }
 
 function formatMegabitsPerSecond(value) {
@@ -1082,6 +1109,176 @@ export async function checkResourceAlerts(env) {
   } catch (e) {
     console.error('资源负载告警检测失败:', e);
   }
+}
+
+export function calculateTrafficDelta(current, previous) {
+  const currentValue = Math.max(0, Number(current) || 0);
+  if (previous === null || previous === undefined) return 0;
+  const previousValue = Math.max(0, Number(previous) || 0);
+  return currentValue >= previousValue ? currentValue - previousValue : currentValue;
+}
+
+export function normalizeTrafficSnapshots(value) {
+  try {
+    const parsed = typeof value === 'string' ? JSON.parse(value || '{}') : value;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const result = {};
+    for (const type of ['daily', 'weekly', 'monthly']) {
+      const snapshot = parsed[type];
+      if (!snapshot || typeof snapshot !== 'object') continue;
+      const time = Number(snapshot.time);
+      if (!Number.isFinite(time) || time <= 0) continue;
+      result[type] = {
+        time,
+        rx_bytes: Math.max(0, Number(snapshot.rx_bytes) || 0),
+        tx_bytes: Math.max(0, Number(snapshot.tx_bytes) || 0)
+      };
+    }
+    return result;
+  } catch (_) {
+    return {};
+  }
+}
+
+export function getTrafficPeriodKeys(timestamp, timezone) {
+  const serial = getZonedDateSerial(timestamp, timezone);
+  const parts = getZonedDateParts(timestamp, timezone);
+  if (!Number.isFinite(serial) || !parts) return null;
+  const weekday = ((serial + 4) % 7 + 7) % 7;
+  const mondayOffset = (weekday + 6) % 7;
+  return {
+    daily: formatDateSerial(serial),
+    weekly: formatDateSerial(serial - mondayOffset),
+    monthly: `${parts.year}-${parts.month}`
+  };
+}
+
+export function getDueTrafficReportTypes(timestamp, timezone) {
+  const keys = getTrafficPeriodKeys(timestamp, timezone);
+  if (!keys) return [];
+  const parts = getZonedDateParts(timestamp, timezone);
+  const serial = getZonedDateSerial(timestamp, timezone);
+  const weekday = ((serial + 4) % 7 + 7) % 7;
+  const types = [];
+  types.push('daily');
+  if (weekday === 1) types.push('weekly');
+  if (Number(parts.day) === 1) types.push('monthly');
+  return types;
+}
+
+export function updateTrafficSnapshots(value, currentRx, currentTx, timestamp, types) {
+  const snapshots = normalizeTrafficSnapshots(value);
+  const nowSeconds = Math.floor(timestamp / 1000);
+  const rx = Math.max(0, Number(currentRx) || 0);
+  const tx = Math.max(0, Number(currentTx) || 0);
+  const usage = {};
+  let changed = false;
+
+  for (const type of types) {
+    const previous = snapshots[type];
+    if (previous) {
+      usage[type] = {
+        rx_bytes: calculateTrafficDelta(rx, previous.rx_bytes),
+        tx_bytes: calculateTrafficDelta(tx, previous.tx_bytes)
+      };
+    }
+    snapshots[type] = { time: nowSeconds, rx_bytes: rx, tx_bytes: tx };
+    changed = true;
+  }
+  return { snapshots, usage, changed };
+}
+
+export function buildTrafficReportContent(servers, rows, label) {
+  const usageByServer = new Map((rows || []).map(row => [row.server_id, row]));
+  const lines = [];
+  const clients = [];
+  let totalRx = 0;
+  let totalTx = 0;
+  let measuredCount = 0;
+  const missingLabels = {
+    '每日': '暂无上一日数据',
+    '每周': '暂无上周数据',
+    '每月': '暂无上月数据'
+  };
+
+  for (const server of servers) {
+    const usage = usageByServer.get(server.id);
+    if (!usage) continue;
+    clients.push(server.name);
+    if (usage.missing) {
+      lines.push(`${server.name}  ${missingLabels[label] || '暂无上一周期数据'}`);
+      continue;
+    }
+    const rx = Math.max(0, Number(usage.rx_bytes) || 0);
+    const tx = Math.max(0, Number(usage.tx_bytes) || 0);
+    totalRx += rx;
+    totalTx += tx;
+    measuredCount += 1;
+    lines.push(`${server.name}  ↓ ${formatTrafficBytes(rx)}  ↑ ${formatTrafficBytes(tx)}  合计 ${formatTrafficBytes(rx + tx)}`);
+  }
+
+  if (lines.length === 0) return null;
+  if (measuredCount > 0) {
+    lines.push(`总计  ↓ ${formatTrafficBytes(totalRx)}  ↑ ${formatTrafficBytes(totalTx)}  合计 ${formatTrafficBytes(totalRx + totalTx)}`);
+  }
+  return {
+    msg: lines.join('\n'),
+    context: {
+      event: `${label}流量报告`,
+      emoji: '📊',
+      clients,
+      count: clients.length,
+      message: lines.join('\n')
+    }
+  };
+}
+
+export async function checkTrafficReports(db, options = {}) {
+  const settings = await loadSiteSettings(db);
+  const now = Number(options.now || Date.now());
+  if (!isTrafficReportEnabled(settings, 'traffic_report_enabled')) return false;
+  if (options.scheduled && !isTrafficReportTimeDue(settings, now)) return false;
+  const reportTypes = getDueTrafficReportTypes(now, settings.notification_timezone);
+  if (reportTypes.length === 0) return false;
+  const servers = await getAllServers(db);
+  const latestMetrics = await getLatestMetricsForAllServers(db);
+  const usageRows = { daily: [], weekly: [], monthly: [] };
+
+  for (const server of servers) {
+    const metrics = latestMetrics.get(server.id);
+    if (!metrics) continue;
+    const result = updateTrafficSnapshots(
+      server.traffic_snapshots,
+      metrics.net_rx,
+      metrics.net_tx,
+      now,
+      reportTypes
+    );
+    for (const type of reportTypes) {
+      usageRows[type].push(result.usage[type]
+        ? { server_id: server.id, ...result.usage[type] }
+        : { server_id: server.id, missing: true });
+    }
+    if (result.changed) {
+      await db.prepare('UPDATE servers SET traffic_snapshots = ? WHERE id = ?')
+        .bind(JSON.stringify(result.snapshots), server.id).run();
+      server.traffic_snapshots = JSON.stringify(result.snapshots);
+    }
+  }
+
+  if (!hasNotificationTarget(settings)) return true;
+  const reports = [
+    reportTypes.includes('daily') ? buildTrafficReportContent(servers, usageRows.daily, '每日') : null,
+    reportTypes.includes('weekly') ? buildTrafficReportContent(servers, usageRows.weekly, '每周') : null,
+    reportTypes.includes('monthly') ? buildTrafficReportContent(servers, usageRows.monthly, '每月') : null
+  ];
+
+  for (const report of reports.filter(Boolean)) {
+    const error = await sendNotification(settings, report.msg, report.context);
+    if (error) console.warn('[TrafficReport] notification failed:', error);
+  }
+
+  return true;
 }
 
 export async function checkExpiringServers(db, options = {}) {
